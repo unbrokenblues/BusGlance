@@ -1,0 +1,15 @@
+# Secrets - never commit real credentials
+secrets.h
+bus_display/secrets.h
+
+# Build artifacts
+build/
+*.bin
+*.hex
+*.elf
+
+# macOS junk
+.DS_Store
+._*
+Icon
+Icon?
