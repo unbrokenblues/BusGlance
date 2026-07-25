@@ -57,10 +57,18 @@ const int   NUM_SERVICES_HOME    = 4;
 const char* SERVICES_OPPOSITE[2] = {"804", "807"};
 const int   NUM_SERVICES_OPPOSITE = 2;
 
+// Weather (Open-Meteo, free, no API key). Set to your area's coordinates.
+const float LATITUDE  = 1.4299;    // your area (northern Singapore)
+const float LONGITUDE = 103.8463;
+const int   FORECAST_AHEAD_HOURS = 3;  // the "later" slot = now + this many hours
+
 // Refresh interval while awake (seconds). Black & white fast refresh is
 // ~1.2s with no 3-minute limit, so we can update often. 60s is a good
 // balance of freshness vs battery (30s = fresher but ~half the runtime).
 const int REFRESH_SECONDS = 60;
+
+// A bus this many minutes away (or less) gets the "arriving soon" black tag.
+const int SOON_MINUTES = 4;
 
 // Active hours (24h format) - outside this window the whole board sleeps.
 // SG buses run ~5am to midnight, so we sleep 00:00-05:00 to save battery.
@@ -646,7 +654,177 @@ void sendLowBatteryPush(float volts) {
   http.end();
 }
 
+// ---------------- WEATHER ----------------
+// Current + one "later" forecast from Open-Meteo (free, no API key).
+
+// Three slots: [0] now, [1] now + AHEAD, [2] now + 2*AHEAD hours.
+float g_temp[3] = {0, 0, 0};
+int   g_rain[3] = {-1, -1, -1};
+int   g_code[3] = {-1, -1, -1};
+char  g_label[3][8] = {"NOW", "--:--", "--:--"};
+bool  g_weatherOK = false;
+
+// WMO weather code -> icon type: 0 sun, 1 sun+cloud, 2 cloud, 3 rain.
+int weatherIconType(int code) {
+  if (code < 0)  return 2;
+  if (code == 0) return 0;
+  if (code <= 2) return 1;
+  if (code == 3 || code == 45 || code == 48) return 2;
+  return 3;
+}
+
+void fetchWeather() {
+  g_weatherOK = false;
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  String url = "https://api.open-meteo.com/v1/forecast?latitude=";
+  url += String(LATITUDE, 4);
+  url += "&longitude=";
+  url += String(LONGITUDE, 4);
+  url += "&current=temperature_2m,weather_code";
+  url += "&hourly=temperature_2m,precipitation_probability,weather_code";
+  url += "&timezone=Asia%2FSingapore&forecast_days=1";
+
+  HTTPClient http;
+  http.begin(url);
+  int code = http.GET();
+  if (code != 200) { http.end(); return; }
+  String payload = http.getString();
+  http.end();
+
+  JsonDocument doc;
+  if (deserializeJson(doc, payload)) return;
+
+  g_temp[0] = doc["current"]["temperature_2m"] | 0.0f;
+  g_code[0] = doc["current"]["weather_code"] | 0;
+
+  struct tm now;
+  if (getLocalTime(&now, 0)) {
+    JsonArray temps = doc["hourly"]["temperature_2m"];
+    JsonArray rains = doc["hourly"]["precipitation_probability"];
+    JsonArray codes = doc["hourly"]["weather_code"];
+    JsonArray times = doc["hourly"]["time"];
+
+    int offs[3] = {0, FORECAST_AHEAD_HOURS, 2 * FORECAST_AHEAD_HOURS};
+    for (int k = 0; k < 3; k++) {
+      int idx = now.tm_hour + offs[k];
+      if (idx > 23) idx = 23;
+      if (idx < 0 || idx >= (int)temps.size()) continue;
+
+      g_rain[k] = rains[idx] | 0;
+      if (k > 0) {                                  // slot 0 uses "current" above
+        g_temp[k] = temps[idx] | 0.0f;
+        g_code[k] = codes[idx] | 0;
+        const char* t = times[idx];                 // e.g. "2026-07-25T20:00"
+        if (t && strlen(t) >= 16) {
+          g_label[k][0] = t[11]; g_label[k][1] = t[12]; g_label[k][2] = ':';
+          g_label[k][3] = t[14]; g_label[k][4] = t[15]; g_label[k][5] = '\0';
+        }
+      }
+    }
+  }
+  g_weatherOK = true;
+}
+
 // ---------------- DRAWING ----------------
+
+// Outline weather icon centered at (cx, cy). type: 0 sun, 1 sun+cloud, 2 cloud, 3 rain.
+void drawWeatherIcon(int cx, int cy, int type) {
+  if (type == 0) {                       // sun: ring + rays (big)
+    display.drawCircle(cx, cy, 7, GxEPD_BLACK);
+    display.drawCircle(cx, cy, 8, GxEPD_BLACK);
+    display.drawLine(cx, cy - 15, cx, cy - 11, GxEPD_BLACK);
+    display.drawLine(cx, cy + 11, cx, cy + 15, GxEPD_BLACK);
+    display.drawLine(cx - 15, cy, cx - 11, cy, GxEPD_BLACK);
+    display.drawLine(cx + 11, cy, cx + 15, cy, GxEPD_BLACK);
+    display.drawLine(cx - 11, cy - 11, cx - 8, cy - 8, GxEPD_BLACK);
+    display.drawLine(cx + 8, cy + 8, cx + 11, cy + 11, GxEPD_BLACK);
+    display.drawLine(cx - 11, cy + 11, cx - 8, cy + 8, GxEPD_BLACK);
+    display.drawLine(cx + 8, cy - 8, cx + 11, cy - 11, GxEPD_BLACK);
+    return;
+  }
+  if (type == 1) {                       // sun peeking, upper-left
+    display.drawCircle(cx - 11, cy - 8, 5, GxEPD_BLACK);
+    display.drawLine(cx - 11, cy - 17, cx - 11, cy - 15, GxEPD_BLACK);
+    display.drawLine(cx - 20, cy - 8, cx - 18, cy - 8, GxEPD_BLACK);
+    display.drawLine(cx - 17, cy - 14, cx - 16, cy - 13, GxEPD_BLACK);
+  }
+  // cloud outline (big): black silhouette, then white interior leaves outline
+  display.fillCircle(cx - 9, cy + 3, 8, GxEPD_BLACK);
+  display.fillCircle(cx + 9, cy + 3, 9, GxEPD_BLACK);
+  display.fillCircle(cx, cy - 4, 10, GxEPD_BLACK);
+  display.fillRect(cx - 17, cy + 3, 35, 10, GxEPD_BLACK);
+  display.fillCircle(cx - 9, cy + 4, 5, GxEPD_WHITE);
+  display.fillCircle(cx + 9, cy + 4, 6, GxEPD_WHITE);
+  display.fillCircle(cx, cy - 3, 7, GxEPD_WHITE);
+  display.fillRect(cx - 14, cy + 5, 29, 7, GxEPD_WHITE);
+  display.drawLine(cx - 17, cy + 13, cx + 18, cy + 13, GxEPD_BLACK);
+  if (type == 3) {                       // rain drops
+    display.drawLine(cx - 9, cy + 16, cx - 10, cy + 21, GxEPD_BLACK);
+    display.drawLine(cx,     cy + 16, cx - 1,  cy + 21, GxEPD_BLACK);
+    display.drawLine(cx + 9, cy + 16, cx + 8,  cy + 21, GxEPD_BLACK);
+  }
+}
+
+// Prints a string centered on x = cx at baseline y (uses current font).
+void printCenteredAt(int cx, int y, const String &s) {
+  int16_t x1, y1;
+  uint16_t w, h;
+  display.getTextBounds(s, 0, y, &x1, &y1, &w, &h);
+  display.setCursor(cx - w / 2, y);
+  display.print(s);
+}
+
+// One weather column centered at cx: label, outline icon, temp (deg), rain%.
+void drawWeatherColumn(int cx, int k) {
+  display.setFont(&FreeSans9pt7b);
+  display.setTextColor(GxEPD_BLACK);
+
+  printCenteredAt(cx, 16, String(g_label[k]));
+  drawWeatherIcon(cx, 44, weatherIconType(g_code[k]));
+
+  // temp and rain% on ONE line, centered, so the icon can be bigger
+  String ts = String((int)round(g_temp[k]));
+  String rs = (g_rain[k] >= 0) ? ("  " + String(g_rain[k]) + "%") : String("  --");
+  int16_t x1, y1;
+  uint16_t wt, wr, h;
+  display.getTextBounds(ts, 0, 0, &x1, &y1, &wt, &h);
+  display.getTextBounds(rs, 0, 0, &x1, &y1, &wr, &h);
+  int sx = cx - (wt + 6 + (int)wr) / 2;      // 6 = degree mark spacing
+  display.setCursor(sx, 74);
+  display.print(ts);
+  int ex = display.getCursorX();
+  display.drawCircle(ex + 3, 65, 2, GxEPD_BLACK);          // degree mark
+  display.setCursor(ex + 6, 74);
+  display.print(rs);
+}
+
+// Top header: date/day + time (left), three weather columns (right). No rule.
+void drawHeader() {
+  struct tm now;
+  bool haveTime = getLocalTime(&now, 0);
+  char dateStr[24] = "";
+  char timeStr[8]  = "--:--";
+  if (haveTime) {
+    strftime(dateStr, sizeof(dateStr), "%a, %d %b %Y", &now);
+    strftime(timeStr, sizeof(timeStr), "%H:%M", &now);
+  }
+
+  display.setTextColor(GxEPD_BLACK);
+  display.setFont(&FreeSans9pt7b);
+  display.setCursor(10, 20);
+  display.print(dateStr);
+
+  display.setFont(&FreeSansBold18pt7b);
+  display.setCursor(10, 56);
+  display.print(timeStr);
+
+  if (g_weatherOK) {
+    drawWeatherColumn(200, 0);
+    drawWeatherColumn(276, 1);
+    drawWeatherColumn(352, 2);
+  }
+}
 
 // Prints one line of text horizontally centered on the 400px-wide screen.
 void drawCenteredLine(const String &s, int baselineY) {
@@ -699,7 +877,7 @@ void drawQuote(const char* quote, int topY) {
 }
 
 // Draws one bus: bold service number on the left, minutes hard-right.
-// A bus 3 minutes away or less (including NOW) gets a filled black tag with
+// A bus SOON_MINUTES away or less (including NOW) gets a filled black tag with
 // white text, so an imminent bus jumps out even in black & white.
 void drawBus(int xLeft, int xRight, int baselineY, BusArrival &b) {
   display.setTextColor(GxEPD_BLACK);
@@ -716,7 +894,7 @@ void drawBus(int xLeft, int xRight, int baselineY, BusArrival &b) {
     soon = true;
   } else {
     mins = String(b.minsAway) + " min";
-    soon = (b.minsAway <= 3);
+    soon = (b.minsAway <= SOON_MINUTES);
   }
 
   display.setFont(&FreeSans18pt7b);
@@ -743,16 +921,16 @@ void drawStopBlock(int yTop, const char* label, BusArrival results[], int count)
   heading.toUpperCase();
 
   // Thick black header bar with white label (Bauhaus, easy on the eye)
-  display.fillRect(10, yTop + 2, 380, 40, GxEPD_BLACK);
+  display.fillRect(10, yTop + 2, 380, 34, GxEPD_BLACK);
   display.setFont(&FreeSansBold18pt7b);
   display.setTextColor(GxEPD_WHITE);
-  drawCenteredLine(heading, yTop + 30);
+  drawCenteredLine(heading, yTop + 27);
   display.setTextColor(GxEPD_BLACK);
 
   const int colL[2]       = {15, 215};
   const int colR[2]       = {185, 385};
-  const int firstBaseline = yTop + 82;
-  const int rowGap        = 56;
+  const int firstBaseline = yTop + 72;
+  const int rowGap        = 52;
 
   for (int i = 0; i < count; i++) {
     int col = i % 2;
@@ -763,7 +941,7 @@ void drawStopBlock(int yTop, const char* label, BusArrival results[], int count)
 
 // Small low-battery icon, drawn white in the top-right of the black HOME bar.
 void drawLowBattIcon() {
-  int x = 356, y = 12;
+  int x = 356, y = 90;
   display.drawRect(x, y, 24, 14, GxEPD_WHITE);         // battery body
   display.fillRect(x + 24, y + 4, 3, 6, GxEPD_WHITE);  // positive nub
   display.fillRect(x + 2, y + 2, 4, 10, GxEPD_WHITE);  // low charge level
@@ -777,18 +955,15 @@ void updateDisplay() {
     display.fillScreen(GxEPD_WHITE);
     display.setTextColor(GxEPD_BLACK);
 
+    // Weather + date/time header (the black HOME bar below separates it)
+    drawHeader();
+
     // Home stop: 4 services in a 2x2 grid
-    drawStopBlock(0, STOP_LABEL_HOME, homeResults, NUM_SERVICES_HOME);
+    drawStopBlock(80, STOP_LABEL_HOME, homeResults, NUM_SERVICES_HOME);
     if (g_showLowBatt) drawLowBattIcon();
 
     // Opposite stop: 2 services side by side
-    drawStopBlock(150, STOP_LABEL_OPPOSITE, oppResults, NUM_SERVICES_OPPOSITE);
-
-    // Quote of the day - picked from the built-in list by date
-    struct tm ti;
-    int qi = 0;
-    if (getLocalTime(&ti, 0)) qi = ti.tm_yday % NUM_QUOTES;
-    drawQuote(QUOTES[qi], 260);
+    drawStopBlock(214, STOP_LABEL_OPPOSITE, oppResults, NUM_SERVICES_OPPOSITE);
 
   } while (display.nextPage());
 }
@@ -835,6 +1010,7 @@ void setup() {
   display.init();
   fetchBusArrivals(STOP_CODE_HOME, SERVICES_HOME, NUM_SERVICES_HOME, homeResults);
   fetchBusArrivals(STOP_CODE_OPPOSITE, SERVICES_OPPOSITE, NUM_SERVICES_OPPOSITE, oppResults);
+  fetchWeather();
 
   // Battery check: show an on-screen icon while low, and push to phone once.
   float vbat = readBatteryVolts();
