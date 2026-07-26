@@ -1,6 +1,28 @@
 # BusGlance — Progress Notes
 
-_Last updated: 2026-07-25_
+_Last updated: 2026-07-27_
+
+## Update 2026-07-27 — live on hardware
+
+- **Flashing DONE.** Firmware runs on the real board: WiFi + LTA + weather all
+  live, crisp black-on-white, overnight sleep re-enabled (`DEBUG_NO_NIGHT_SLEEP
+  = false`).
+- **Partial refresh does NOT work on this panel.** Tested on hardware: partial
+  updates render as grey, ghosted mush (this is a 3-color GDEY042Z98 panel
+  driven as B/W). Kept the light-sleep + partial-refresh plumbing but set
+  `FULL_REFRESH_EVERY = 1` (full refresh every cycle = crisp, with the black
+  flash). The flash takes ~10-14s to settle — unavoidable on this panel.
+- **Fix = swap to a TRUE B/W panel: `GDEY042T81`** (WeAct 4.2" Black-White,
+  SSD1683, ~$19.46, WeAct Studio Official Store on AliExpress). Confirmed by a
+  buyer review running it with partial refresh. Drop-in: same wiring, same case,
+  same driver — just set `FULL_REFRESH_EVERY = 15` for smooth flash-free ~0.4s
+  partial refresh. NOT yet ordered.
+- **Font/icon polish:** minutes auto-shrink so 3-digit bus numbers never overlap
+  the "N min"; weather icons redrawn as uniform 2px outlines.
+- **Battery:** LiPo confirmed safe (board `+` = red wire). Charge via USB-C
+  (board charges while running). Battery low-warning (on-screen + ntfy push to
+  topic `busglance-dicky`) is a no-op on this board — pin 35 can't read VBAT, so
+  it fail-safes silent. Decision: just **charge weekly** (~7-10 day runtime).
 
 An ESP32 + 4.2" e-paper display that shows live Singapore bus arrival times
 (LTA DataMall) for two stops, plus a daily uplifting quote. Battery-powered,

@@ -29,6 +29,8 @@
 #include <GxEPD2_BW.h>
 #include <Fonts/FreeSansBold18pt7b.h>
 #include <Fonts/FreeSansBold24pt7b.h>
+#include <Fonts/FreeSansBold12pt7b.h>
+#include <Fonts/FreeSansBold9pt7b.h>
 #include <Fonts/FreeSans18pt7b.h>
 #include <Fonts/FreeSans9pt7b.h>
 
@@ -67,8 +69,21 @@ const int   FORECAST_AHEAD_HOURS = 3;  // the "later" slot = now + this many hou
 // balance of freshness vs battery (30s = fresher but ~half the runtime).
 const int REFRESH_SECONDS = 60;
 
+// How often to do a clean FULL (flashing) refresh vs a quiet PARTIAL one.
+//   1  => full refresh EVERY cycle: crisp image, but a black flash each time.
+//   15 => partial most cycles (no flash) + a full flash ~every 15 min.
+// This 3-color panel driven as B/W renders partial refreshes as grey, ghosted
+// mush, so we keep it at 1 (full every time). A TRUE B/W GDEY042T81 panel does
+// partial cleanly + fast (~0.4s) - swap the panel, then set this to 15.
+const int FULL_REFRESH_EVERY = 1;
+
 // A bus this many minutes away (or less) gets the "arriving soon" black tag.
 const int SOON_MINUTES = 4;
+
+// DEBUG: while true, the board NEVER sleeps overnight - it keeps refreshing
+// 24/7 so we can test past midnight. Set back to false before real use so it
+// saves battery by sleeping 00:00-05:00.
+const bool DEBUG_NO_NIGHT_SLEEP = false;
 
 // Active hours (24h format) - outside this window the whole board sleeps.
 // SG buses run ~5am to midnight, so we sleep 00:00-05:00 to save battery.
@@ -487,6 +502,7 @@ BusArrival oppResults[2];
 // ---------------- WIFI ----------------
 
 void connectWiFi() {
+  if (WiFi.status() == WL_CONNECTED) return;   // already up (same awake session)
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   Serial.print("Connecting to WiFi");
@@ -518,6 +534,7 @@ bool syncTime() {
 }
 
 bool isWithinActiveHours(const struct tm &t) {
+  if (DEBUG_NO_NIGHT_SLEEP) return true;   // debugging: always "active"
   int nowMinutes   = t.tm_hour * 60 + t.tm_min;
   int startMinutes = ACTIVE_START_HOUR * 60 + ACTIVE_START_MIN;
   int endMinutes   = ACTIVE_END_HOUR * 60 + ACTIVE_END_MIN;
@@ -683,7 +700,7 @@ void fetchWeather() {
   url += String(LONGITUDE, 4);
   url += "&current=temperature_2m,weather_code";
   url += "&hourly=temperature_2m,precipitation_probability,weather_code";
-  url += "&timezone=Asia%2FSingapore&forecast_days=1";
+  url += "&timezone=Asia%2FSingapore&forecast_days=2";
 
   HTTPClient http;
   http.begin(url);
@@ -707,8 +724,7 @@ void fetchWeather() {
 
     int offs[3] = {0, FORECAST_AHEAD_HOURS, 2 * FORECAST_AHEAD_HOURS};
     for (int k = 0; k < 3; k++) {
-      int idx = now.tm_hour + offs[k];
-      if (idx > 23) idx = 23;
+      int idx = now.tm_hour + offs[k];   // forecast_days=2 gives 48 hourly points
       if (idx < 0 || idx >= (int)temps.size()) continue;
 
       g_rain[k] = rains[idx] | 0;
@@ -729,40 +745,39 @@ void fetchWeather() {
 // ---------------- DRAWING ----------------
 
 // Outline weather icon centered at (cx, cy). type: 0 sun, 1 sun+cloud, 2 cloud, 3 rain.
+// A uniform 2px-thick sun: outer ring + short solid rays. Uniform everywhere.
+static void drawSun(int cx, int cy, int r) {
+  display.fillCircle(cx, cy, r, GxEPD_BLACK);
+  display.fillCircle(cx, cy, r - 2, GxEPD_WHITE);          // 2px ring
+  display.fillRect(cx - 1, cy - (r + 7), 3, 5, GxEPD_BLACK);   // N
+  display.fillRect(cx - 1, cy + (r + 2), 3, 5, GxEPD_BLACK);   // S
+  display.fillRect(cx - (r + 7), cy - 1, 5, 3, GxEPD_BLACK);   // W
+  display.fillRect(cx + (r + 2), cy - 1, 5, 3, GxEPD_BLACK);   // E
+}
+
 void drawWeatherIcon(int cx, int cy, int type) {
-  if (type == 0) {                       // sun: ring + rays (big)
-    display.drawCircle(cx, cy, 7, GxEPD_BLACK);
-    display.drawCircle(cx, cy, 8, GxEPD_BLACK);
-    display.drawLine(cx, cy - 15, cx, cy - 11, GxEPD_BLACK);
-    display.drawLine(cx, cy + 11, cx, cy + 15, GxEPD_BLACK);
-    display.drawLine(cx - 15, cy, cx - 11, cy, GxEPD_BLACK);
-    display.drawLine(cx + 11, cy, cx + 15, cy, GxEPD_BLACK);
-    display.drawLine(cx - 11, cy - 11, cx - 8, cy - 8, GxEPD_BLACK);
-    display.drawLine(cx + 8, cy + 8, cx + 11, cy + 11, GxEPD_BLACK);
-    display.drawLine(cx - 11, cy + 11, cx - 8, cy + 8, GxEPD_BLACK);
-    display.drawLine(cx + 8, cy - 8, cx + 11, cy - 11, GxEPD_BLACK);
+  if (type == 0) {                       // clear: sun only
+    drawSun(cx, cy, 8);
     return;
   }
-  if (type == 1) {                       // sun peeking, upper-left
-    display.drawCircle(cx - 11, cy - 8, 5, GxEPD_BLACK);
-    display.drawLine(cx - 11, cy - 17, cx - 11, cy - 15, GxEPD_BLACK);
-    display.drawLine(cx - 20, cy - 8, cx - 18, cy - 8, GxEPD_BLACK);
-    display.drawLine(cx - 17, cy - 14, cx - 16, cy - 13, GxEPD_BLACK);
+  if (type == 1) {                       // partly cloudy: small sun peeking, then cloud over it
+    drawSun(cx - 12, cy - 8, 5);
   }
-  // cloud outline (big): black silhouette, then white interior leaves outline
-  display.fillCircle(cx - 9, cy + 3, 8, GxEPD_BLACK);
-  display.fillCircle(cx + 9, cy + 3, 9, GxEPD_BLACK);
-  display.fillCircle(cx, cy - 4, 10, GxEPD_BLACK);
-  display.fillRect(cx - 17, cy + 3, 35, 10, GxEPD_BLACK);
-  display.fillCircle(cx - 9, cy + 4, 5, GxEPD_WHITE);
-  display.fillCircle(cx + 9, cy + 4, 6, GxEPD_WHITE);
-  display.fillCircle(cx, cy - 3, 7, GxEPD_WHITE);
-  display.fillRect(cx - 14, cy + 5, 29, 7, GxEPD_WHITE);
-  display.drawLine(cx - 17, cy + 13, cx + 18, cy + 13, GxEPD_BLACK);
-  if (type == 3) {                       // rain drops
-    display.drawLine(cx - 9, cy + 16, cx - 10, cy + 21, GxEPD_BLACK);
-    display.drawLine(cx,     cy + 16, cx - 1,  cy + 21, GxEPD_BLACK);
-    display.drawLine(cx + 9, cy + 16, cx + 8,  cy + 21, GxEPD_BLACK);
+  // Cloud drawn as a UNIFORM outline: solid black silhouette, then the same
+  // silhouette inset by 2px in white -> leaves an even 2px border all around.
+  const int S = 2;
+  display.fillCircle(cx - 9, cy + 3, 8,  GxEPD_BLACK);
+  display.fillCircle(cx + 9, cy + 3, 9,  GxEPD_BLACK);
+  display.fillCircle(cx,     cy - 4, 10, GxEPD_BLACK);
+  display.fillRect(cx - 17, cy + 3, 35, 12, GxEPD_BLACK);
+  display.fillCircle(cx - 9, cy + 3, 8  - S, GxEPD_WHITE);
+  display.fillCircle(cx + 9, cy + 3, 9  - S, GxEPD_WHITE);
+  display.fillCircle(cx,     cy - 4, 10 - S, GxEPD_WHITE);
+  display.fillRect(cx - 17 + S, cy + 3, 35 - 2*S, 12 - S, GxEPD_WHITE);  // keep bottom edge
+  if (type == 3) {                       // rain drops (solid, uniform)
+    display.fillRect(cx - 9, cy + 17, 3, 6, GxEPD_BLACK);
+    display.fillRect(cx - 1, cy + 17, 3, 6, GxEPD_BLACK);
+    display.fillRect(cx + 7, cy + 17, 3, 6, GxEPD_BLACK);
   }
 }
 
@@ -777,7 +792,7 @@ void printCenteredAt(int cx, int y, const String &s) {
 
 // One weather column centered at cx: label, outline icon, temp (deg), rain%.
 void drawWeatherColumn(int cx, int k) {
-  display.setFont(&FreeSans9pt7b);
+  display.setFont(&FreeSansBold9pt7b);
   display.setTextColor(GxEPD_BLACK);
 
   printCenteredAt(cx, 16, String(g_label[k]));
@@ -811,7 +826,7 @@ void drawHeader() {
   }
 
   display.setTextColor(GxEPD_BLACK);
-  display.setFont(&FreeSans9pt7b);
+  display.setFont(&FreeSansBold9pt7b);
   display.setCursor(10, 20);
   display.print(dateStr);
 
@@ -884,6 +899,7 @@ void drawBus(int xLeft, int xRight, int baselineY, BusArrival &b) {
   display.setFont(&FreeSansBold24pt7b);
   display.setCursor(xLeft, baselineY);
   display.print(b.service);
+  int numRight = display.getCursorX();     // right edge of the service number
 
   String mins;
   bool soon = false;
@@ -897,19 +913,30 @@ void drawBus(int xLeft, int xRight, int baselineY, BusArrival &b) {
     soon = (b.minsAway <= SOON_MINUTES);
   }
 
-  display.setFont(&FreeSans18pt7b);
-  int16_t x1, y1;
-  uint16_t w, h;
-  display.getTextBounds(mins, 0, baselineY, &x1, &y1, &w, &h);
-  int tx = xRight - (int)w;
+  // Minutes sit hard-right. Use the big 18pt font, but if that would collide
+  // with the (3-digit) service number, drop to 12pt. A hard clamp guarantees
+  // they never overlap even in the worst case (e.g. "17 min").
+  const int GAP = 10;
+  display.setFont(&FreeSansBold18pt7b);
+  int16_t mx, my;
+  uint16_t mw, mh;
+  display.getTextBounds(mins, 0, 0, &mx, &my, &mw, &mh);
+  if (numRight + GAP + (int)mw > xRight) {
+    display.setFont(&FreeSansBold12pt7b);
+    display.getTextBounds(mins, 0, 0, &mx, &my, &mw, &mh);
+  }
+  int tx = xRight - (int)mw - mx;
+  if (tx < numRight + GAP) tx = numRight + GAP;   // never cross the number
+  int minBase = baselineY - 5;
 
-  if (soon) {
-    display.fillRect(tx - 7, baselineY - 23, (int)w + 14, 32, GxEPD_BLACK);
+  if (soon) {                              // filled tag, snug + centered on the text
+    const int pad = 5;
+    display.fillRect(tx + mx - pad, minBase + my - pad, (int)mw + 2*pad, (int)mh + 2*pad, GxEPD_BLACK);
     display.setTextColor(GxEPD_WHITE);
   } else {
     display.setTextColor(GxEPD_BLACK);
   }
-  display.setCursor(tx, baselineY);
+  display.setCursor(tx, minBase);
   display.print(mins);
   display.setTextColor(GxEPD_BLACK);
 }
@@ -920,11 +947,14 @@ void drawStopBlock(int yTop, const char* label, BusArrival results[], int count)
   String heading = String(label);
   heading.toUpperCase();
 
-  // Thick black header bar with white label (Bauhaus, easy on the eye)
-  display.fillRect(10, yTop + 2, 380, 34, GxEPD_BLACK);
+  // Thick black header bar with white label, vertically centered in the bar
+  const int barTop = yTop + 2, barH = 34;
+  display.fillRect(10, barTop, 380, barH, GxEPD_BLACK);
   display.setFont(&FreeSansBold18pt7b);
   display.setTextColor(GxEPD_WHITE);
-  drawCenteredLine(heading, yTop + 27);
+  int16_t hx, hy; uint16_t hw, hh;
+  display.getTextBounds(heading, 0, 0, &hx, &hy, &hw, &hh);
+  drawCenteredLine(heading, barTop + (barH - (int)hh) / 2 - hy);
   display.setTextColor(GxEPD_BLACK);
 
   const int colL[2]       = {15, 215};
@@ -947,9 +977,13 @@ void drawLowBattIcon() {
   display.fillRect(x + 2, y + 2, 4, 10, GxEPD_WHITE);  // low charge level
 }
 
-void updateDisplay() {
+void updateDisplay(bool full) {
   display.setRotation(0);
-  display.setFullWindow();
+  if (full) {
+    display.setFullWindow();                                   // clean, flashes
+  } else {
+    display.setPartialWindow(0, 0, display.width(), display.height());  // quiet, no flash
+  }
   display.firstPage();
   do {
     display.fillScreen(GxEPD_WHITE);
@@ -1006,8 +1040,17 @@ void setup() {
     deepSleepUntilActiveStart(now);   // does not return
   }
 
-  // Service hours: fetch and draw.
+  // Service hours: init the panel ONCE. Keeping it initialised (never
+  // hibernated) between updates is what lets the later refreshes be partial.
   display.init();
+  doRefreshCycle(true);   // first draw of the session is a clean FULL refresh
+  sleepUntilNextRefresh();
+}
+
+// Fetch fresh data + battery status, then repaint. full=true does a clean
+// flashing refresh; full=false does a quiet partial refresh (no black flash).
+void doRefreshCycle(bool full) {
+  connectWiFi();                         // reconnect after the sleep (no-op if up)
   fetchBusArrivals(STOP_CODE_HOME, SERVICES_HOME, NUM_SERVICES_HOME, homeResults);
   fetchBusArrivals(STOP_CODE_OPPOSITE, SERVICES_OPPOSITE, NUM_SERVICES_OPPOSITE, oppResults);
   fetchWeather();
@@ -1024,16 +1067,32 @@ void setup() {
     g_lowBattNotified = false;  // recovered after charging -> re-arm alerts
   }
 
-  updateDisplay();
-  display.hibernate();   // put the panel into its lowest-power state
+  updateDisplay(full);
+}
 
-  // Sleep until the next refresh.
-  esp_sleep_enable_timer_wakeup((uint64_t)REFRESH_SECONDS * 1000000ULL);
-  Serial.println("Sleeping until next refresh...");
+// Turn WiFi off (save power) and LIGHT-sleep until the next refresh. Light
+// sleep keeps RAM + the panel's state alive, so partial refresh keeps working;
+// the RTC clock and TZ also survive it. Execution resumes at the next loop().
+void sleepUntilNextRefresh() {
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  Serial.println("Light-sleeping until next refresh...");
   Serial.flush();
-  esp_deep_sleep_start();
+  esp_sleep_enable_timer_wakeup((uint64_t)REFRESH_SECONDS * 1000000ULL);
+  esp_light_sleep_start();
 }
 
 void loop() {
-  // not used - everything happens once per wake cycle in setup()
+  static int cycle = 0;
+
+  // If we've crossed into the overnight window, power right down until 5am.
+  struct tm now;
+  if (getLocalTime(&now, 0) && !isWithinActiveHours(now)) {
+    deepSleepUntilActiveStart(now);   // does not return; setup() runs at 5am
+  }
+
+  cycle++;
+  bool full = (cycle % FULL_REFRESH_EVERY == 0);   // periodic ghost-clearing flash
+  doRefreshCycle(full);
+  sleepUntilNextRefresh();
 }
