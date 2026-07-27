@@ -37,14 +37,20 @@ LIP_CLR    = 0.3           # slip clearance per side
 SNAP_BUMP  = 0.4           # how far the lip's ridge sticks past the wall (interference)
 SNAP_GROOVE= 0.8           # groove depth cut into the wall (the ridge clicks into this)
 
-# ESP32 board cradle (on the back plate) - 50 x 25 incl. USB-C overhang.
-# USB-C exits the BOTTOM-LEFT (confirmed from photo: USB-C left of the battery plug).
+# ESP32 cradle + screws on the back plate. 50 x 25 envelope (incl. USB-C overhang).
+# USB-C exits BOTTOM-LEFT. Screwed down through its 2 measured mounting holes.
 ESP_L, ESP_W = 50.0, 25.0
 ESP_CLR   = 0.6            # slip fit in the cradle
 CR_WALL   = 2.0           # cradle wall thickness
 CR_H      = 6.0           # cradle wall height
-USB_W, USB_H = 16.0, 8.0  # USB-C slot (wide to tolerate the port's offset)
-USB_CX    = 30.0          # USB-C slot centre X - LEFT of centre (case centre ~45.5)
+ESP_FLOOR = 2.0           # raised cradle floor: full board support + M2 thread depth
+ESP_PILOT_D = 1.5         # M2 self-tap pilot
+ESP_X0, ESP_Y0 = 17.5, -1.25   # placement: board's bottom-left (USB corner) in case coords
+# measured holes from the board's bottom-left corner: (2, 9) & (23, 47);
+# +1mm on Y for the USB-C overhang the 50mm envelope includes.
+ESP_HOLES = [(ESP_X0 + 2, ESP_Y0 + 10), (ESP_X0 + 23, ESP_Y0 + 48)]
+USB_W, USB_H = 16.0, 8.0  # USB-C slot (wide to tolerate the port offset)
+USB_CX    = 24.0          # USB-C centre X - bottom-LEFT (~7mm from the board's left edge)
 
 ENG = 'manifold'
 
@@ -98,13 +104,16 @@ back = back.union(bx(INNER_W-2*LIP_CLR, INNER_H-2*LIP_CLR, LIP_H, CX, CY, LIP_H/
 back = back.union(rrect(INNER_W-2*LIP_CLR+2*SNAP_BUMP, INNER_H-2*LIP_CLR+2*SNAP_BUMP, 1.0,
                         BODY_R, CX, CY, LIP_H-1.0), engine=ENG)   # snap ridge
 
-# ESP32 cradle: a 50x25 pocket, USB-C end open toward the bottom-LEFT (aligned to USB_CX)
-ecx, ecy = USB_CX, Y_BOT + WALL + ESP_L/2 + 1      # cradle over the USB slot, long axis along Y
+# ESP32 cradle: raised-floor pocket (long axis along Y), USB-C end open toward the bottom wall.
+ecx, ecy = ESP_X0 + ESP_W/2, ESP_Y0 + ESP_L/2
 ow, oh = ESP_L + 2*CR_WALL + ESP_CLR, ESP_W + 2*CR_WALL + ESP_CLR
-cradle = bx(oh, ow, CR_H, ecx, ecy, CR_H/2)        # ESP oriented long-axis along Y
-cradle = cradle.difference(bx(ESP_W+ESP_CLR, ESP_L+ESP_CLR, CR_H+2, ecx, ecy, CR_H/2), engine=ENG)
-cradle = cradle.difference(bx(USB_W, CR_WALL+2, CR_H+2, ecx, ecy-ow/2, CR_H/2), engine=ENG)  # open USB end
+cradle = bx(oh, ow, CR_H, ecx, ecy, CR_H/2)                                                   # solid block
+cradle = cradle.difference(bx(ESP_W+ESP_CLR, ESP_L+ESP_CLR, CR_H, ecx, ecy, ESP_FLOOR+CR_H/2), engine=ENG)  # pocket above the 2mm floor
+cradle = cradle.difference(bx(USB_W, CR_WALL+2, CR_H, ecx, ecy-ow/2, ESP_FLOOR+CR_H/2), engine=ENG)          # open USB end
 back = back.union(cradle, engine=ENG)
+# 2 screw pilots (M2) through the raised floor into the back plate, at the measured holes
+for (hx,hy) in ESP_HOLES:
+    back = back.difference(cyl(ESP_PILOT_D/2, ESP_FLOOR+2.0, hx, hy, 0.0), engine=ENG)
 
 # wall-mount keyholes (unchanged idea)
 for kx in (CX-28, CX+28):
@@ -127,9 +136,9 @@ fig=plt.figure(figsize=(13,4.6))
 ax=fig.add_subplot(1,3,1,projection='3d'); draw(ax,shell,(0.20,0.42,0.70))
 ax.set_box_aspect((1,1,0.55)); ax.view_init(elev=-88,azim=-90); ax.set_axis_off(); ax.set_xlim(0,MOD_W); ax.set_ylim(0,MOD_H); ax.set_zlim(-6,FS_DEPTH+22); ax.set_title('front (flat, rounded edges)',fontsize=10)
 ax=fig.add_subplot(1,3,2,projection='3d'); draw(ax,back,(0.75,0.35,0.30))
-ax.set_box_aspect((1,1,0.55)); ax.view_init(elev=32,azim=-60); ax.set_axis_off(); ax.set_xlim(0,MOD_W); ax.set_ylim(0,MOD_H); ax.set_zlim(-BACKT-3,CR_H+22); ax.set_title('back plate (tubes + ESP32 cradle)',fontsize=10)
+ax.set_box_aspect((1,1,0.55)); ax.view_init(elev=24,azim=-50); ax.set_axis_off(); ax.set_xlim(0,MOD_W); ax.set_ylim(0,MOD_H); ax.set_zlim(-BACKT-3,CR_H+22); ax.set_title('inside: snap lip + ESP32 cradle (filament box)',fontsize=10)
 ax=fig.add_subplot(1,3,3,projection='3d'); draw(ax,back,(0.75,0.35,0.30))
-ax.set_box_aspect((1,1,0.5)); ax.view_init(elev=-88,azim=-90); ax.set_axis_off(); ax.set_xlim(0,MOD_W); ax.set_ylim(0,MOD_H); ax.set_zlim(-BACKT-3,CR_H+5); ax.set_title('back (keyholes + screw c-bores)',fontsize=10)
+ax.set_box_aspect((1,1,0.5)); ax.view_init(elev=88,azim=-90); ax.set_axis_off(); ax.set_xlim(0,MOD_W); ax.set_ylim(0,MOD_H); ax.set_zlim(-BACKT-3,CR_H+5); ax.set_title('outside: flat back + keyholes',fontsize=10)
 plt.tight_layout(); plt.savefig('/Users/dickyagustiady/Projects/BusSchedule/case/preview.png',dpi=115,bbox_inches='tight')
 print("front watertight:",shell.is_watertight," back watertight:",back.is_watertight)
 print("outer:",round(OUTER_W,1),"x",round(OUTER_H,1),"x",round(FS_DEPTH,1),"mm | cavity",round(INNER_W,1),"x",round(INNER_H,1))

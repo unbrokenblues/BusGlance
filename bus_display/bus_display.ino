@@ -493,7 +493,9 @@ GxEPD2_BW<GxEPD2_420_GDEY042T81, GxEPD2_420_GDEY042T81::HEIGHT>
 
 struct BusArrival {
   String service;
-  int minsAway;   // -1 means "no data"
+  int minsAway;    // next bus, minutes away. -1 means "no data"
+  int minsAway2;   // the bus after that. -1 means "no data"
+  int minsAway3;   // and the one after that. -1 means "no data"
 };
 
 BusArrival homeResults[4];
@@ -561,12 +563,27 @@ void deepSleepUntilActiveStart(const struct tm &now) {
 
 // ---------------- LTA API ----------------
 
+// Parses an LTA EstimatedArrival timestamp (e.g. 2026-07-25T14:32:10+08:00)
+// into whole minutes from now. Returns -1 if empty/unparseable, 0 if in the past.
+int minutesUntilArrival(const char* estArrival) {
+  if (estArrival == nullptr || strlen(estArrival) == 0) return -1;
+  struct tm arrivalTm = {};
+  int y, mo, d, h, mi, s;
+  if (sscanf(estArrival, "%d-%d-%dT%d:%d:%d", &y, &mo, &d, &h, &mi, &s) != 6) return -1;
+  arrivalTm.tm_year = y - 1900; arrivalTm.tm_mon = mo - 1; arrivalTm.tm_mday = d;
+  arrivalTm.tm_hour = h; arrivalTm.tm_min = mi; arrivalTm.tm_sec = s;
+  int m = (int)((mktime(&arrivalTm) - time(nullptr)) / 60);
+  return (m < 0) ? 0 : m;
+}
+
 // Fetches arrival times for one stop, filling result[] with
 // minutes-away for each service in wantedServices[].
 void fetchBusArrivals(const char* stopCode, const char* wantedServices[], int count, BusArrival result[]) {
   for (int i = 0; i < count; i++) {
     result[i].service = wantedServices[i];
     result[i].minsAway = -1;
+    result[i].minsAway2 = -1;
+    result[i].minsAway3 = -1;
   }
 
   if (WiFi.status() != WL_CONNECTED) return;
@@ -616,29 +633,9 @@ void fetchBusArrivals(const char* stopCode, const char* wantedServices[], int co
     }
     if (slot == -1) continue;
 
-    const char* estArrival = svc["NextBus"]["EstimatedArrival"];
-    if (estArrival == nullptr || strlen(estArrival) == 0) {
-      result[slot].minsAway = -1;
-      continue;
-    }
-
-    // EstimatedArrival looks like: 2026-07-25T14:32:10+08:00
-    struct tm arrivalTm = {};
-    int y, mo, d, h, mi, s;
-    sscanf(estArrival, "%d-%d-%dT%d:%d:%d", &y, &mo, &d, &h, &mi, &s);
-    arrivalTm.tm_year = y - 1900;
-    arrivalTm.tm_mon = mo - 1;
-    arrivalTm.tm_mday = d;
-    arrivalTm.tm_hour = h;
-    arrivalTm.tm_min = mi;
-    arrivalTm.tm_sec = s;
-    time_t arrivalEpoch = mktime(&arrivalTm);
-
-    time_t nowEpoch = time(nullptr);
-    int minsAway = (int)((arrivalEpoch - nowEpoch) / 60);
-    if (minsAway < 0) minsAway = 0;
-
-    result[slot].minsAway = minsAway;
+    result[slot].minsAway  = minutesUntilArrival(svc["NextBus"]["EstimatedArrival"]);
+    result[slot].minsAway2 = minutesUntilArrival(svc["NextBus2"]["EstimatedArrival"]);
+    result[slot].minsAway3 = minutesUntilArrival(svc["NextBus3"]["EstimatedArrival"]);
   }
 }
 
@@ -691,7 +688,10 @@ int weatherIconType(int code) {
 }
 
 void fetchWeather() {
-  g_weatherOK = false;
+  // NOTE: we do NOT clear g_weatherOK / the weather data up front. If this fetch
+  // fails (network blip, Open-Meteo hiccup), we keep showing the last-good
+  // weather instead of blanking the header. RAM survives light sleep, so the
+  // previous values persist between refreshes. Only a success overwrites them.
   if (WiFi.status() != WL_CONNECTED) return;
 
   String url = "https://api.open-meteo.com/v1/forecast?latitude=";
@@ -774,10 +774,10 @@ void drawWeatherIcon(int cx, int cy, int type) {
   display.fillCircle(cx + 9, cy + 3, 9  - S, GxEPD_WHITE);
   display.fillCircle(cx,     cy - 4, 10 - S, GxEPD_WHITE);
   display.fillRect(cx - 17 + S, cy + 3, 35 - 2*S, 12 - S, GxEPD_WHITE);  // keep bottom edge
-  if (type == 3) {                       // rain drops (solid, uniform)
-    display.fillRect(cx - 9, cy + 17, 3, 6, GxEPD_BLACK);
-    display.fillRect(cx - 1, cy + 17, 3, 6, GxEPD_BLACK);
-    display.fillRect(cx + 7, cy + 17, 3, 6, GxEPD_BLACK);
+  if (type == 3) {                       // rain drops (short, so they clear the temp text)
+    display.fillRect(cx - 9, cy + 15, 3, 5, GxEPD_BLACK);
+    display.fillRect(cx - 1, cy + 15, 3, 5, GxEPD_BLACK);
+    display.fillRect(cx + 7, cy + 15, 3, 5, GxEPD_BLACK);
   }
 }
 
@@ -796,7 +796,7 @@ void drawWeatherColumn(int cx, int k) {
   display.setTextColor(GxEPD_BLACK);
 
   printCenteredAt(cx, 16, String(g_label[k]));
-  drawWeatherIcon(cx, 44, weatherIconType(g_code[k]));
+  drawWeatherIcon(cx, 38, weatherIconType(g_code[k]));   // raised so rain drops clear the temp text
 
   // temp and rain% on ONE line, centered, so the icon can be bigger
   String ts = String((int)round(g_temp[k]));
@@ -901,35 +901,57 @@ void drawBus(int xLeft, int xRight, int baselineY, BusArrival &b) {
   display.print(b.service);
   int numRight = display.getCursorX();     // right edge of the service number
 
+  // Primary = next bus (big, with a black tag if imminent).
   String mins;
   bool soon = false;
   if (b.minsAway < 0) {
     mins = "-";
   } else if (b.minsAway == 0) {
-    mins = "NOW";
+    mins = "0";          // arriving now = 0 min (tag still makes it pop)
     soon = true;
   } else {
-    mins = String(b.minsAway) + " min";
+    mins = String(b.minsAway);      // just the number - "min" dropped
     soon = (b.minsAway <= SOON_MINUTES);
   }
 
-  // Minutes sit hard-right. Use the big 18pt font, but if that would collide
-  // with the (3-digit) service number, drop to 12pt. A hard clamp guarantees
-  // they never overlap even in the worst case (e.g. "17 min").
-  const int GAP = 10;
-  display.setFont(&FreeSansBold18pt7b);
-  int16_t mx, my;
-  uint16_t mw, mh;
+  // Secondary = the next TWO buses after (small, raised), when we have them.
+  String s2 = "";
+  if (b.minsAway >= 0 && b.minsAway2 >= 0) {
+    s2 = String(b.minsAway2);
+    if (b.minsAway3 >= 0) s2 += " " + String(b.minsAway3);
+  }
+  int16_t sx, sy; uint16_t sw = 0, sh = 0;
+  if (s2.length()) {
+    display.setFont(&FreeSansBold9pt7b);
+    display.getTextBounds(s2, 0, 0, &sx, &sy, &sw, &sh);
+  }
+
+  // Pick the primary font so number + primary + secondary all fit; else shrink.
+  const int GAP = 10, SGAP = 12;
+  int secW = s2.length() ? (SGAP + (int)sw) : 0;
+  const GFXfont* pf = &FreeSansBold18pt7b;
+  display.setFont(pf);
+  int16_t mx, my; uint16_t mw, mh;
   display.getTextBounds(mins, 0, 0, &mx, &my, &mw, &mh);
-  if (numRight + GAP + (int)mw > xRight) {
-    display.setFont(&FreeSansBold12pt7b);
+  if (numRight + GAP + (int)mw + secW > xRight) {
+    pf = &FreeSansBold12pt7b;
+    display.setFont(pf);
     display.getTextBounds(mins, 0, 0, &mx, &my, &mw, &mh);
   }
-  int tx = xRight - (int)mw - mx;
-  if (tx < numRight + GAP) tx = numRight + GAP;   // never cross the number
-  int minBase = baselineY - 5;
 
-  if (soon) {                              // filled tag, snug + centered on the text
+  int minBase = baselineY - 5;
+  // Right-align the [primary][secondary] group to xRight.
+  int s2x = 0, s2base = minBase - 11;      // secondary raised like a superscript
+  int groupRight = xRight;
+  if (s2.length()) {
+    s2x = xRight - (int)sw - sx;
+    groupRight = s2x - SGAP;
+  }
+  int tx = groupRight - (int)mw - mx;
+  if (tx < numRight + GAP) tx = numRight + GAP;   // never cross the number
+
+  display.setFont(pf);
+  if (soon) {                              // filled tag, snug + centered on the primary
     const int pad = 5;
     display.fillRect(tx + mx - pad, minBase + my - pad, (int)mw + 2*pad, (int)mh + 2*pad, GxEPD_BLACK);
     display.setTextColor(GxEPD_WHITE);
@@ -939,6 +961,12 @@ void drawBus(int xLeft, int xRight, int baselineY, BusArrival &b) {
   display.setCursor(tx, minBase);
   display.print(mins);
   display.setTextColor(GxEPD_BLACK);
+
+  if (s2.length()) {                       // the "after" bus, small + raised
+    display.setFont(&FreeSansBold9pt7b);
+    display.setCursor(s2x, s2base);
+    display.print(s2);
+  }
 }
 
 // Draws a centered uppercase label, a bold rule, then buses in a 2-column grid.
@@ -955,6 +983,12 @@ void drawStopBlock(int yTop, const char* label, BusArrival results[], int count)
   int16_t hx, hy; uint16_t hw, hh;
   display.getTextBounds(heading, 0, 0, &hx, &hy, &hw, &hh);
   drawCenteredLine(heading, barTop + (barH - (int)hh) / 2 - hy);
+  // tiny "MIN" legend on the RIGHT of the bar (the bare numbers below are minutes)
+  display.setFont(&FreeSansBold9pt7b);
+  int16_t lx, ly; uint16_t lw, lh;
+  display.getTextBounds("MIN", 0, 0, &lx, &ly, &lw, &lh);
+  display.setCursor(382 - (int)lw - lx, barTop + (barH - (int)lh) / 2 - ly);
+  display.print("MIN");
   display.setTextColor(GxEPD_BLACK);
 
   const int colL[2]       = {15, 215};
