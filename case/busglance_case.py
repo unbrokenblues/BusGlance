@@ -5,13 +5,14 @@ import numpy as np, trimesh
 from trimesh.creation import box, cylinder
 
 # ================= MEASURED PARAMETERS =================
-# Display module (the screen PCB) - measured off the ruler photos
-MOD_W, MOD_H = 91.0, 89.0     # long edge x short edge
-MODULE_T     = 2.0            # PCB thickness
-HOLE_D       = 3.0            # corner mounting-hole diameter
-# corner holes: 86mm apart (along 91) and 84mm apart (along 89) => 2.5mm inset
-HX = [2.5, MOD_W - 2.5]       # -> 2.5, 88.5
-HY = [2.5, MOD_H - 2.5]       # -> 2.5, 86.5
+# Display module (the screen PCB) - EXACT values from the WeAct-EpaperModule-4.2
+# STEP model (github.com/WeActStudio/WeActStudio.EpaperModule), header edge = top.
+MOD_W, MOD_H = 91.8, 89.8     # width (header edge) x height  [was 91x89 measured]
+MODULE_T     = 2.0            # PCB thickness (STEP: 1.69mm PCB; keep 2.0 for the pocket)
+HOLE_D       = 3.2            # corner mounting-hole diameter (STEP: 3.20)
+# corner holes: 2.8mm inset from each edge (STEP) -> 86.2mm x 84.2mm hole-to-hole
+HX = [2.8, MOD_W - 2.8]       # -> 2.8, 89.0
+HY = [2.8, MOD_H - 2.8]       # -> 2.8, 87.0
 holes = [(x, y) for x in HX for y in HY]
 
 # Case shell
@@ -23,8 +24,8 @@ DEPTH  = 28.0                 # cavity depth: 25mm display+wire stack + a little
 BODY_R = 6.0                  # rounded vertical-edge radius (front/back stay FLAT)
 
 # Window (matches the active glass ~84.8x63.6, offset UP on the board)
-WIN_W, WIN_H = 86.0, 66.0
-WIN_OFF_TOP  = 9.0            # glass sits ~9mm below the top (header) edge
+WIN_W, WIN_H = 86.0, 66.0    # size is right (fits the screen); position was 1.5mm too low
+WIN_OFF_TOP  = 7.5           # shifted the whole window UP 1.5mm (9->7.5) to cover the bottom PCB strip
 WIN_R = 6.0
 
 # Display screws straight into the thick flat front (short M2.5). No poles.
