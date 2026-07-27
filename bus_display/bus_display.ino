@@ -565,15 +565,26 @@ void deepSleepUntilActiveStart(const struct tm &now) {
 
 // Parses an LTA EstimatedArrival timestamp (e.g. 2026-07-25T14:32:10+08:00)
 // into whole minutes from now. Returns -1 if empty/unparseable, 0 if in the past.
+// ---------------- FAILSAFE / STALENESS ----------------
+// If the device can't refresh live bus data it must FAIL LOUD - a frozen screen
+// showing old times is dangerous (you'd wait for a bus that already left).
+bool g_busFetchOK = false;                 // did THIS cycle reach the LTA API (HTTP 200)?
+RTC_DATA_ATTR time_t g_lastGoodEpoch = 0;  // epoch of the last cycle with fresh, time-synced data
+const int STALE_SECONDS = 5 * 60;          // older than this -> show the OFFLINE warning
+
 int minutesUntilArrival(const char* estArrival) {
   if (estArrival == nullptr || strlen(estArrival) == 0) return -1;
+  time_t nowEpoch = time(nullptr);
+  if (nowEpoch < 1700000000L) return -1;   // clock not synced -> "minutes away" is meaningless (avoids garbage)
   struct tm arrivalTm = {};
   int y, mo, d, h, mi, s;
   if (sscanf(estArrival, "%d-%d-%dT%d:%d:%d", &y, &mo, &d, &h, &mi, &s) != 6) return -1;
   arrivalTm.tm_year = y - 1900; arrivalTm.tm_mon = mo - 1; arrivalTm.tm_mday = d;
   arrivalTm.tm_hour = h; arrivalTm.tm_min = mi; arrivalTm.tm_sec = s;
-  int m = (int)((mktime(&arrivalTm) - time(nullptr)) / 60);
-  return (m < 0) ? 0 : m;
+  int m = (int)((mktime(&arrivalTm) - nowEpoch) / 60);
+  if (m < 0) return 0;
+  if (m > 240) return -1;                  // absurd -> treat as no data
+  return m;
 }
 
 // Fetches arrival times for one stop, filling result[] with
@@ -605,6 +616,7 @@ void fetchBusArrivals(const char* stopCode, const char* wantedServices[], int co
     http.end();
     return;
   }
+  g_busFetchOK = true;   // reached the API and got 200 -> the data path is healthy
 
   String payload = http.getString();
   http.end();
@@ -1011,6 +1023,32 @@ void drawLowBattIcon() {
   display.fillRect(x + 2, y + 2, 4, 10, GxEPD_WHITE);  // low charge level
 }
 
+// FAIL LOUD: if live data is stale (or we never got any), overlay an unmissable
+// black OFFLINE bar across the top so old bus times can't be mistaken for live.
+void drawStaleBanner() {
+  time_t nowE = time(nullptr);
+  bool timeValid = nowE > 1700000000L;
+  bool stale = (g_lastGoodEpoch == 0) || (timeValid && (nowE - g_lastGoodEpoch > STALE_SECONDS));
+  if (!stale) return;
+
+  display.fillRect(0, 0, 400, 28, GxEPD_BLACK);           // covers the (also-stale) header
+  display.setTextColor(GxEPD_WHITE);
+  display.setFont(&FreeSansBold12pt7b);
+  String msg;
+  if (g_lastGoodEpoch == 0) {
+    msg = "OFFLINE - NO DATA";
+  } else {
+    struct tm lt; char hhmm[8] = "--:--";
+    if (localtime_r(&g_lastGoodEpoch, &lt)) strftime(hhmm, sizeof(hhmm), "%H:%M", &lt);
+    msg = String("! OFFLINE - times as of ") + hhmm;
+  }
+  int16_t x1, y1; uint16_t w, h;
+  display.getTextBounds(msg, 0, 0, &x1, &y1, &w, &h);
+  display.setCursor((400 - (int)w) / 2, 20);
+  display.print(msg);
+  display.setTextColor(GxEPD_BLACK);
+}
+
 void updateDisplay(bool full) {
   display.setRotation(0);
   if (full) {
@@ -1032,6 +1070,8 @@ void updateDisplay(bool full) {
 
     // Opposite stop: 2 services side by side
     drawStopBlock(214, STOP_LABEL_OPPOSITE, oppResults, NUM_SERVICES_OPPOSITE);
+
+    drawStaleBanner();   // FAIL LOUD if the live data is stale
 
   } while (display.nextPage());
 }
@@ -1085,8 +1125,14 @@ void setup() {
 // flashing refresh; full=false does a quiet partial refresh (no black flash).
 void doRefreshCycle(bool full) {
   connectWiFi();                         // reconnect after the sleep (no-op if up)
+  if (!g_haveSynced) {                   // NTP failed at boot? keep retrying each cycle until it works
+    if (syncTime()) g_haveSynced = true;
+  }
+  g_busFetchOK = false;                   // reset; set true if a fetch reaches the API this cycle
   fetchBusArrivals(STOP_CODE_HOME, SERVICES_HOME, NUM_SERVICES_HOME, homeResults);
   fetchBusArrivals(STOP_CODE_OPPOSITE, SERVICES_OPPOSITE, NUM_SERVICES_OPPOSITE, oppResults);
+  // Mark data "fresh" only if we actually reached the API AND the clock is valid.
+  if (g_busFetchOK && g_haveSynced && time(nullptr) > 1700000000L) g_lastGoodEpoch = time(nullptr);
   fetchWeather();
 
   // Battery check: show an on-screen icon while low, and push to phone once.
