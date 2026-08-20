@@ -1081,6 +1081,8 @@ void updateDisplay(bool full) {
 // Survives deep sleep (stored in RTC memory): true once we've synced the
 // clock over the network at least once, so later wakes can trust the RTC.
 RTC_DATA_ATTR bool g_haveSynced = false;
+RTC_DATA_ATTR time_t g_lastSyncEpoch = 0;   // when we last successfully synced NTP
+const int NTP_RESYNC_SECONDS = 30 * 60;     // re-check the real clock every 30 min
 
 void setup() {
   Serial.begin(115200);
@@ -1105,6 +1107,7 @@ void setup() {
   connectWiFi();
   if (syncTime()) {
     g_haveSynced = true;
+    g_lastSyncEpoch = time(nullptr);
     getLocalTime(&now, 0);
     timeKnown = true;
   }
@@ -1125,8 +1128,16 @@ void setup() {
 // flashing refresh; full=false does a quiet partial refresh (no black flash).
 void doRefreshCycle(bool full) {
   connectWiFi();                         // reconnect after the sleep (no-op if up)
-  if (!g_haveSynced) {                   // NTP failed at boot? keep retrying each cycle until it works
-    if (syncTime()) g_haveSynced = true;
+  // Re-sync NTP periodically, not just once. The board now stays awake all day
+  // (light sleep, no overnight reboot for partial refresh), so the ESP32's
+  // internal oscillator has hours to drift a few minutes if we never re-check -
+  // that drift silently corrupts every "minutes away" calc (bus times read low,
+  // even show false NOW/0 for buses that haven't arrived yet).
+  time_t nowE = time(nullptr);
+  bool neverSynced = !g_haveSynced;
+  bool dueForResync = g_haveSynced && (nowE - g_lastSyncEpoch > NTP_RESYNC_SECONDS);
+  if (neverSynced || dueForResync) {
+    if (syncTime()) { g_haveSynced = true; g_lastSyncEpoch = time(nullptr); }
   }
   g_busFetchOK = false;                   // reset; set true if a fetch reaches the API this cycle
   fetchBusArrivals(STOP_CODE_HOME, SERVICES_HOME, NUM_SERVICES_HOME, homeResults);
