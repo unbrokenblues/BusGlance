@@ -1082,7 +1082,9 @@ void updateDisplay(bool full) {
 // clock over the network at least once, so later wakes can trust the RTC.
 RTC_DATA_ATTR bool g_haveSynced = false;
 RTC_DATA_ATTR time_t g_lastSyncEpoch = 0;   // when we last successfully synced NTP
-const int NTP_RESYNC_SECONDS = 30 * 60;     // re-check the real clock every 30 min
+const int NTP_RESYNC_SECONDS = 10 * 60;     // re-check the real clock every 10 min
+// WiFi is already active every 60s cycle for the bus+weather fetches, so this
+// adds one tiny (~50 byte) NTP packet on top - negligible extra battery cost.
 
 void setup() {
   Serial.begin(115200);
