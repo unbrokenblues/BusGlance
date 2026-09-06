@@ -25,6 +25,8 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <time.h>
+#include <esp_sntp.h>
+#include <esp_system.h>
 
 #include <GxEPD2_BW.h>
 #include <Fonts/FreeSansBold18pt7b.h>
@@ -98,9 +100,23 @@ const int ACTIVE_END_MIN    = 59;
 // instead of false-alarming. On first boot, check the Serial log to confirm
 // the voltage is realistic. If your board can't sense it, set this to false.
 const bool  BATTERY_MONITOR = true;
-const int   BATTERY_ADC_PIN = 35;     // common VBAT-sense pin - CONFIRM for your board
-const float BATTERY_DIVIDER = 2.0;    // board halves VBAT before the pin, so x2 to undo
-const float LOW_BATT_VOLTS  = 3.45;   // warn below this (~15-20% left on a LiPo)
+const int   BATTERY_ADC_PIN = 34;     // free pin (confirmed via ADC scan) + external 2x100k divider
+const float BATTERY_DIVIDER = 2.0;    // external 2x100k divider halves VBAT, so x2 to undo
+// Warn below this % (via batteryPercent()'s LiPo curve) - the SAME curve that
+// drives the on-screen gauge, so the two can never silently contradict each
+// other again. (The old fixed 3.45V threshold actually mapped to ~3% on this
+// curve, not the intended ~15-20% - the alert would have fired right before
+// shutdown instead of with a useful warning buffer.)
+const int LOW_BATT_PERCENT = 15;
+const int LOW_BATT_REARM_PERCENT = LOW_BATT_PERCENT + 5;   // re-arm once recovered above this
+
+// Critically low: skip WiFi/HTTPS entirely and just rest. A tired cell can
+// brown out mid-WiFi-burst -> reset -> straight back into WiFi -> brownout
+// again - a loop with ZERO sleep in between that can drive the LiPo into
+// over-discharge. This is the emergency stop for that; no on-screen "charge
+// me" UX yet (deliberately deferred), just silently rest and try again later.
+const float CRITICAL_BATT_VOLTS = 3.30;
+const long  CRITICAL_BATT_SLEEP_SEC = 30L * 60;   // 30 min
 
 // Phone push for low battery via ntfy.sh (free, no account). Install the ntfy
 // app, subscribe to YOUR topic below, and alerts arrive on your phone. Change
@@ -505,6 +521,12 @@ BusArrival oppResults[2];
 
 void connectWiFi() {
   if (WiFi.status() == WL_CONNECTED) return;   // already up (same awake session)
+  // Reconnecting fresh every ~60s (every deep-sleep wake) with persistent
+  // storage on writes the WiFi config to flash (NVS) on every connect AND on
+  // every disconnect - ~2 writes x 1440 cycles/day adds up to real flash wear
+  // over a year. Keep it in RAM only; nothing here needs to survive a reboot
+  // (we already reconnect with the same hardcoded credentials every time).
+  WiFi.persistent(false);
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   Serial.print("Connecting to WiFi");
@@ -524,16 +546,42 @@ void connectWiFi() {
 
 // ---------------- TIME (for active-hours check) ----------------
 
+// Set by the lwIP task the instant a real NTP reply is applied to the clock.
+// Plain RAM (not RTC_DATA_ATTR) on purpose: deep sleep wipes it every wake, so
+// it can never carry a stale "synced" flag over from a previous cycle.
+static volatile bool g_ntpReplyApplied = false;
+static void onNtpSync(struct timeval *tv) { g_ntpReplyApplied = true; }
+
+// True ONLY if a real NTP round-trip completed during this call. Comparing
+// time() before/after does NOT work: the ESP32 wall clock free-runs (ticks
+// forward on its own every second) regardless of whether NTP replied, so it
+// would report "success" within ~1s even with the radio off - proving nothing.
 bool syncTime() {
+  g_ntpReplyApplied = false;
+  sntp_set_time_sync_notification_cb(onNtpSync);
   configTime(8 * 3600, 0, "pool.ntp.org", "time.nist.gov"); // UTC+8 = Singapore
-  struct tm timeinfo;
-  int attempts = 0;
-  while (!getLocalTime(&timeinfo) && attempts < 10) {
-    delay(500);
-    attempts++;
+  for (int i = 0; i < 30; i++) {           // up to 3s; a healthy reply lands ~200ms
+    delay(100);
+    if (g_ntpReplyApplied && time(nullptr) > 1700000000L) return true;
   }
-  return attempts < 10;
+  return false;
 }
+
+// Survives deep sleep (stored in RTC memory): true once we've synced the
+// clock over the network at least once, so later wakes can trust the RTC.
+RTC_DATA_ATTR bool g_haveSynced = false;
+RTC_DATA_ATTR time_t g_lastSyncEpoch = 0;   // when we last successfully synced NTP
+const int NTP_RESYNC_SECONDS = 10 * 60;     // re-check the real clock every 10 min
+// WiFi is already active every 60s cycle for the bus+weather fetches, so this
+// adds one tiny (~50 byte) NTP packet on top - negligible extra battery cost.
+
+// Backoff after a failed NTP attempt so an unreachable time server can't cost
+// radio-on time every single 60s cycle. A cycle count, not epoch math - on a
+// cold boot the clock reads ~0, so a time-based check would wrongly block the
+// very first sync attempt. Declared here (not near setup()) because
+// deepSleepUntilActiveStart() below needs to reset it before the overnight sleep.
+RTC_DATA_ATTR uint32_t g_syncSkipCycles = 0;
+const uint32_t NTP_RETRY_BACKOFF_CYCLES = 5;   // ~5 min at REFRESH_SECONDS=60
 
 bool isWithinActiveHours(const struct tm &t) {
   if (DEBUG_NO_NIGHT_SLEEP) return true;   // debugging: always "active"
@@ -557,6 +605,11 @@ void deepSleepUntilActiveStart(const struct tm &now) {
   Serial.println(sleepSec / 60);
   Serial.flush();
 
+  // Don't carry an NTP-retry backoff across a 5h overnight sleep - a failed
+  // sync right before midnight would otherwise delay the morning re-sync by
+  // several cycles on top of the drift already accumulated overnight.
+  g_syncSkipCycles = 0;
+
   esp_sleep_enable_timer_wakeup((uint64_t)sleepSec * 1000000ULL);
   esp_deep_sleep_start();
 }
@@ -568,7 +621,7 @@ void deepSleepUntilActiveStart(const struct tm &now) {
 // ---------------- FAILSAFE / STALENESS ----------------
 // If the device can't refresh live bus data it must FAIL LOUD - a frozen screen
 // showing old times is dangerous (you'd wait for a bus that already left).
-bool g_busFetchOK = false;                 // did THIS cycle reach the LTA API (HTTP 200)?
+bool g_busFetchOK = false;                 // did BOTH stops fetch+parse OK this cycle?
 RTC_DATA_ATTR time_t g_lastGoodEpoch = 0;  // epoch of the last cycle with fresh, time-synced data
 const int STALE_SECONDS = 5 * 60;          // older than this -> show the OFFLINE warning
 
@@ -589,7 +642,13 @@ int minutesUntilArrival(const char* estArrival) {
 
 // Fetches arrival times for one stop, filling result[] with
 // minutes-away for each service in wantedServices[].
-void fetchBusArrivals(const char* stopCode, const char* wantedServices[], int count, BusArrival result[]) {
+// Returns true only if this stop's data was actually fetched AND parsed - the
+// caller requires BOTH stops to succeed before marking the cycle "fresh".
+// (Previously a single shared flag was set true on HTTP 200 alone, and either
+// stop succeeding masked the other's total failure - a fully-failed HOME fetch
+// with a healthy OPPOSITE fetch would show HOME as all "-" with no OFFLINE
+// banner, indistinguishable from "no buses running right now".)
+bool fetchBusArrivals(const char* stopCode, const char* wantedServices[], int count, BusArrival result[]) {
   for (int i = 0; i < count; i++) {
     result[i].service = wantedServices[i];
     result[i].minsAway = -1;
@@ -597,7 +656,7 @@ void fetchBusArrivals(const char* stopCode, const char* wantedServices[], int co
     result[i].minsAway3 = -1;
   }
 
-  if (WiFi.status() != WL_CONNECTED) return;
+  if (WiFi.status() != WL_CONNECTED) return false;
 
   HTTPClient http;
   String url = "https://datamall2.mytransport.sg/ltaodataservice/v3/BusArrival?BusStopCode=";
@@ -614,9 +673,8 @@ void fetchBusArrivals(const char* stopCode, const char* wantedServices[], int co
     Serial.print(": ");
     Serial.println(httpCode);
     http.end();
-    return;
+    return false;
   }
-  g_busFetchOK = true;   // reached the API and got 200 -> the data path is healthy
 
   String payload = http.getString();
   http.end();
@@ -627,7 +685,7 @@ void fetchBusArrivals(const char* stopCode, const char* wantedServices[], int co
   if (err) {
     Serial.print("JSON parse failed: ");
     Serial.println(err.c_str());
-    return;
+    return false;
   }
 
   JsonArray services = doc["Services"].as<JsonArray>();
@@ -649,46 +707,81 @@ void fetchBusArrivals(const char* stopCode, const char* wantedServices[], int co
     result[slot].minsAway2 = minutesUntilArrival(svc["NextBus2"]["EstimatedArrival"]);
     result[slot].minsAway3 = minutesUntilArrival(svc["NextBus3"]["EstimatedArrival"]);
   }
+  return true;   // reached the API and successfully parsed the response
 }
 
 // ---------------- BATTERY ----------------
 
 RTC_DATA_ATTR bool g_lowBattNotified = false;  // survives sleep: already pushed?
 bool g_showLowBatt = false;                    // draw the icon this cycle?
+int  g_battPercent = -1;                       // rough gauge (-1 = no reading), for the header icon
 
 // Reads battery volts, or -1 if monitoring is off or the reading is implausible
 // (pin probably not wired to the battery - so we won't false-alarm).
 float readBatteryVolts() {
   if (!BATTERY_MONITOR) return -1.0f;
-  uint32_t mv = analogReadMilliVolts(BATTERY_ADC_PIN);
-  float v = (mv / 1000.0f) * BATTERY_DIVIDER;
+  // Average several samples: the 100k+100k divider's ~50k source impedance is
+  // a bit outside the ADC's comfort zone, so a single read is noisy. Cheap
+  // (well under 1ms total, no radio involved).
+  uint32_t sum = 0;
+  const int SAMPLES = 16;
+  for (int i = 0; i < SAMPLES; i++) sum += analogReadMilliVolts(BATTERY_ADC_PIN);
+  float v = (sum / (float)SAMPLES / 1000.0f) * BATTERY_DIVIDER;
   if (v < 2.5f || v > 4.5f) return -1.0f;  // outside LiPo range -> not connected
   return v;
 }
 
+// Estimates charge % from a 1S LiPo's resting voltage. NOT lab-accurate (the
+// discharge curve is flat in the middle, and voltage sags a little under WiFi
+// load) - good enough for "roughly how much is left", not a precise fuel gauge.
+// Piecewise-linear over the standard 1S LiPo discharge curve.
+int batteryPercent(float v) {
+  if (v <= 0) return -1;
+  static const float V[] = {4.20, 4.06, 3.98, 3.92, 3.87, 3.82, 3.79, 3.77, 3.73, 3.69, 3.61, 3.27};
+  static const int   P[] = {100,   90,   80,   70,   60,   50,   40,   30,   20,   10,    5,    0};
+  const int N = 12;
+  if (v >= V[0]) return 100;
+  if (v <= V[N - 1]) return 0;
+  for (int i = 0; i < N - 1; i++) {
+    if (v <= V[i] && v >= V[i + 1]) {
+      float t = (v - V[i + 1]) / (V[i] - V[i + 1]);
+      return (int)round(P[i + 1] + t * (P[i] - P[i + 1]));
+    }
+  }
+  return 0;
+}
+
 // Sends a one-off low-battery push to your phone via ntfy.sh.
-void sendLowBatteryPush(float volts) {
-  if (WiFi.status() != WL_CONNECTED) return;
+// Returns true only if the push genuinely reached ntfy.sh (2xx). The caller
+// latches g_lowBattNotified on this result - if we return false on a dropped
+// WiFi/HTTP failure, the caller must NOT latch, or a single failed push would
+// silently mean no alert ever fires again until the battery recovers.
+bool sendLowBatteryPush(float volts) {
+  if (WiFi.status() != WL_CONNECTED) return false;
   HTTPClient http;
   http.begin(String("https://ntfy.sh/") + NTFY_TOPIC);
   http.addHeader("Title", "BusGlance battery low");
   http.addHeader("Priority", "high");
   http.addHeader("Tags", "battery");
   char body[64];
-  snprintf(body, sizeof(body), "Battery at %.2fV - please charge soon.", volts);
-  http.POST((uint8_t*)body, strlen(body));
+  snprintf(body, sizeof(body), "Battery at %.2fV (~%d%%) - please charge soon.",
+           volts, batteryPercent(volts));
+  int code = http.POST((uint8_t*)body, strlen(body));
   http.end();
+  return code >= 200 && code < 300;
 }
 
 // ---------------- WEATHER ----------------
 // Current + one "later" forecast from Open-Meteo (free, no API key).
 
 // Three slots: [0] now, [1] now + AHEAD, [2] now + 2*AHEAD hours.
-float g_temp[3] = {0, 0, 0};
-int   g_rain[3] = {-1, -1, -1};
-int   g_code[3] = {-1, -1, -1};
-char  g_label[3][8] = {"NOW", "--:--", "--:--"};
-bool  g_weatherOK = false;
+// RTC_DATA_ATTR: must survive deep sleep so a failed fetch shows last-good
+// weather instead of blanking the header (see the sticky-fetch note below).
+RTC_DATA_ATTR float g_temp[3] = {0, 0, 0};
+RTC_DATA_ATTR int   g_rain[3] = {-1, -1, -1};
+RTC_DATA_ATTR int   g_code[3] = {-1, -1, -1};
+RTC_DATA_ATTR char  g_label[3][8] = {"NOW", "--:--", "--:--"};
+RTC_DATA_ATTR bool  g_weatherOK = false;
 
 // WMO weather code -> icon type: 0 sun, 1 sun+cloud, 2 cloud, 3 rain.
 int weatherIconType(int code) {
@@ -702,8 +795,8 @@ int weatherIconType(int code) {
 void fetchWeather() {
   // NOTE: we do NOT clear g_weatherOK / the weather data up front. If this fetch
   // fails (network blip, Open-Meteo hiccup), we keep showing the last-good
-  // weather instead of blanking the header. RAM survives light sleep, so the
-  // previous values persist between refreshes. Only a success overwrites them.
+  // weather instead of blanking the header. These globals are RTC_DATA_ATTR so
+  // they persist across deep sleep too. Only a success overwrites them.
   if (WiFi.status() != WL_CONNECTED) return;
 
   String url = "https://api.open-meteo.com/v1/forecast?latitude=";
@@ -845,6 +938,12 @@ void drawHeader() {
   display.setFont(&FreeSansBold18pt7b);
   display.setCursor(10, 56);
   display.print(timeStr);
+
+  // Battery gauge in the gap right after the time text (computed, not
+  // hardcoded, so it can't overlap the time no matter the exact digit widths).
+  int16_t bx1, by1; uint16_t bw, bh;
+  display.getTextBounds(timeStr, 10, 56, &bx1, &by1, &bw, &bh);
+  drawBatteryGauge(10 + (int)bw + 14, 40, g_battPercent);
 
   if (g_weatherOK) {
     drawWeatherColumn(200, 0);
@@ -1015,9 +1114,21 @@ void drawStopBlock(int yTop, const char* label, BusArrival results[], int count)
   }
 }
 
+// Always-on battery gauge (black outline + proportional fill), drawn on the
+// WHITE header background. Skipped entirely if there's no reading (percent<0),
+// so it stays invisible until the divider is wired - no layout change either way.
+void drawBatteryGauge(int x, int y, int percent) {
+  if (percent < 0) return;
+  const int w = 20, h = 11;
+  display.drawRect(x, y, w, h, GxEPD_BLACK);              // body outline
+  display.fillRect(x + w, y + 3, 2, h - 6, GxEPD_BLACK);  // positive-terminal nub
+  int fillW = (w - 2) * constrain(percent, 0, 100) / 100;
+  if (fillW > 0) display.fillRect(x + 1, y + 1, fillW, h - 2, GxEPD_BLACK);
+}
+
 // Small low-battery icon, drawn white in the top-right of the black HOME bar.
 void drawLowBattIcon() {
-  int x = 356, y = 90;
+  int x = 316, y = 90;   // was 356 - collided with the "MIN" legend (both white on black)
   display.drawRect(x, y, 24, 14, GxEPD_WHITE);         // battery body
   display.fillRect(x + 24, y + 4, 3, 6, GxEPD_WHITE);  // positive nub
   display.fillRect(x + 2, y + 2, 4, 10, GxEPD_WHITE);  // low charge level
@@ -1078,17 +1189,23 @@ void updateDisplay(bool full) {
 
 // ---------------- SETUP / LOOP ----------------
 
-// Survives deep sleep (stored in RTC memory): true once we've synced the
-// clock over the network at least once, so later wakes can trust the RTC.
-RTC_DATA_ATTR bool g_haveSynced = false;
-RTC_DATA_ATTR time_t g_lastSyncEpoch = 0;   // when we last successfully synced NTP
-const int NTP_RESYNC_SECONDS = 10 * 60;     // re-check the real clock every 10 min
-// WiFi is already active every 60s cycle for the bus+weather fetches, so this
-// adds one tiny (~50 byte) NTP packet on top - negligible extra battery cost.
-
 void setup() {
   Serial.begin(115200);
   delay(200);
+
+  // Brownout / critically-low-battery guard, checked FIRST, before any WiFi
+  // work. A reset caused by brownout means the last cycle likely browned out
+  // mid-WiFi-burst - going straight back into WiFi risks an immediate repeat
+  // with no sleep in between. Also check the voltage directly in case this
+  // boot is otherwise normal but the cell has since dropped below safe.
+  float earlyVbat = readBatteryVolts();
+  if (esp_reset_reason() == ESP_RST_BROWNOUT ||
+      (earlyVbat > 0 && earlyVbat < CRITICAL_BATT_VOLTS)) {
+    Serial.println("Critically low battery / brownout reset - resting, no WiFi this cycle.");
+    Serial.flush();
+    esp_sleep_enable_timer_wakeup((uint64_t)CRITICAL_BATT_SLEEP_SEC * 1000000ULL);
+    esp_deep_sleep_start();   // does not return
+  }
 
   // The TZ env var is wiped on every deep-sleep wake, so set it each boot.
   // The RTC clock itself keeps running through sleep, so once we've synced
@@ -1096,96 +1213,93 @@ void setup() {
   setenv("TZ", "SGT-8", 1);   // Singapore, UTC+8
   tzset();
 
+  // Once we've synced even once, the RTC keeps running through deep sleep, so
+  // deciding "is it night?" costs nothing here - no radio needed. (10ms timeout,
+  // not 0, avoids a rare spurious "no time" if millis() ticks mid-check.)
   struct tm now;
-  bool timeKnown = g_haveSynced && getLocalTime(&now, 0);
-
-  // Fast path: we already know the time and it's the middle of the night ->
-  // sleep straight through to 5am without ever powering up WiFi.
-  if (timeKnown && !isWithinActiveHours(now)) {
+  if (g_haveSynced && getLocalTime(&now, 10) && !isWithinActiveHours(now)) {
     deepSleepUntilActiveStart(now);   // does not return
   }
 
-  // Otherwise we need the network (first boot, or it's daytime).
-  connectWiFi();
-  if (syncTime()) {
-    g_haveSynced = true;
-    g_lastSyncEpoch = time(nullptr);
-    getLocalTime(&now, 0);
-    timeKnown = true;
-  }
-
-  // Re-check with the freshly synced time in case we woke right at a boundary.
-  if (timeKnown && !isWithinActiveHours(now)) {
-    deepSleepUntilActiveStart(now);   // does not return
-  }
-
-  // Service hours: init the panel ONCE. Keeping it initialised (never
-  // hibernated) between updates is what lets the later refreshes be partial.
+  // Daytime, or we don't know the time yet (first-ever boot): run a cycle.
+  // doRefreshCycle owns ALL networking (WiFi connect + throttled NTP resync) -
+  // deciding it here too would reconnect/resync twice and defeat the resync
+  // throttle, since every wake re-enters this function fresh (see below).
+  // If this happens to be the very first boot and it's actually night, the
+  // next wake 60s from now takes the fast path above - one wasted cycle, once,
+  // ever.
   display.init();
-  doRefreshCycle(true);   // first draw of the session is a clean FULL refresh
-  sleepUntilNextRefresh();
+  doRefreshCycle(true);   // every wake is a fresh boot -> always a full refresh
+  sleepUntilNextRefresh();   // does not return; execution resumes back in setup()
 }
 
-// Fetch fresh data + battery status, then repaint. full=true does a clean
-// flashing refresh; full=false does a quiet partial refresh (no black flash).
+// Fetch fresh data + battery status, repaint, then hibernate the panel.
+// full=true does a clean flashing refresh; full=false would do a quiet partial
+// refresh, but that mode is unreachable now (see sleepUntilNextRefresh) - kept
+// so the plumbing is ready if a true B/W panel + light-sleep mode comes back.
 void doRefreshCycle(bool full) {
-  connectWiFi();                         // reconnect after the sleep (no-op if up)
-  // Re-sync NTP periodically, not just once. The board now stays awake all day
-  // (light sleep, no overnight reboot for partial refresh), so the ESP32's
-  // internal oscillator has hours to drift a few minutes if we never re-check -
-  // that drift silently corrupts every "minutes away" calc (bus times read low,
-  // even show false NOW/0 for buses that haven't arrived yet).
+  // Read the battery BEFORE WiFi connects - a reading taken while the radio is
+  // transmitting is sagged (loaded) and reads artificially low.
+  float vbat = readBatteryVolts();
+  Serial.print("Battery volts: ");
+  Serial.println(vbat);
+  g_battPercent = batteryPercent(vbat);   // rough gauge for the header icon; -1 if not connected
+
+  connectWiFi();                         // fresh connect - deep sleep tore WiFi down
+  // Re-sync NTP periodically, not just once, as extra insurance against clock
+  // drift (each wake also gets a fresh sync attempt below via g_haveSynced).
   time_t nowE = time(nullptr);
-  bool neverSynced = !g_haveSynced;
-  bool dueForResync = g_haveSynced && (nowE - g_lastSyncEpoch > NTP_RESYNC_SECONDS);
-  if (neverSynced || dueForResync) {
-    if (syncTime()) { g_haveSynced = true; g_lastSyncEpoch = time(nullptr); }
+  bool wantSync = !g_haveSynced || (nowE - g_lastSyncEpoch > NTP_RESYNC_SECONDS);
+  if (wantSync && g_syncSkipCycles > 0) { g_syncSkipCycles--; wantSync = false; }
+  if (wantSync) {
+    if (syncTime()) { g_haveSynced = true; g_lastSyncEpoch = time(nullptr); g_syncSkipCycles = 0; }
+    else            { g_syncSkipCycles = NTP_RETRY_BACKOFF_CYCLES; }
   }
-  g_busFetchOK = false;                   // reset; set true if a fetch reaches the API this cycle
-  fetchBusArrivals(STOP_CODE_HOME, SERVICES_HOME, NUM_SERVICES_HOME, homeResults);
-  fetchBusArrivals(STOP_CODE_OPPOSITE, SERVICES_OPPOSITE, NUM_SERVICES_OPPOSITE, oppResults);
+  // Require BOTH stops to succeed before calling the cycle "fresh" - either
+  // one alone succeeding must not mask the other's total failure (see the
+  // note on fetchBusArrivals above).
+  bool homeOK = fetchBusArrivals(STOP_CODE_HOME, SERVICES_HOME, NUM_SERVICES_HOME, homeResults);
+  bool oppOK  = fetchBusArrivals(STOP_CODE_OPPOSITE, SERVICES_OPPOSITE, NUM_SERVICES_OPPOSITE, oppResults);
+  g_busFetchOK = homeOK && oppOK;
   // Mark data "fresh" only if we actually reached the API AND the clock is valid.
   if (g_busFetchOK && g_haveSynced && time(nullptr) > 1700000000L) g_lastGoodEpoch = time(nullptr);
   fetchWeather();
 
-  // Battery check: show an on-screen icon while low, and push to phone once.
-  float vbat = readBatteryVolts();
-  Serial.print("Battery volts: ");
-  Serial.println(vbat);
-  g_showLowBatt = (vbat > 0 && vbat < LOW_BATT_VOLTS);
+  // Battery: show an on-screen icon while low, and push to phone once
+  // (vbat/g_battPercent were already read above, before WiFi connected).
+  g_showLowBatt = (g_battPercent >= 0 && g_battPercent < LOW_BATT_PERCENT);
   if (g_showLowBatt && !g_lowBattNotified) {
-    sendLowBatteryPush(vbat);
-    g_lowBattNotified = true;
-  } else if (vbat > LOW_BATT_VOLTS + 0.15f) {
+    // Only latch on a CONFIRMED send. If this attempt drops (WiFi hiccup,
+    // ntfy.sh unreachable), leave it unlatched so we retry next cycle instead
+    // of silently losing the alert until the battery happens to recover.
+    g_lowBattNotified = sendLowBatteryPush(vbat);
+  } else if (g_battPercent > LOW_BATT_REARM_PERCENT) {
     g_lowBattNotified = false;  // recovered after charging -> re-arm alerts
   }
 
+  WiFi.mode(WIFI_OFF);   // all networking for this cycle is done - drop the radio
+                         // before the refresh; sleepUntilNextRefresh() no longer needs to.
   updateDisplay(full);
+  display.hibernate();   // panel draws ~0 power until the next display.init()
 }
 
-// Turn WiFi off (save power) and LIGHT-sleep until the next refresh. Light
-// sleep keeps RAM + the panel's state alive, so partial refresh keeps working;
-// the RTC clock and TZ also survive it. Execution resumes at the next loop().
+// Turn WiFi off and DEEP-sleep until the next refresh. Deep sleep draws far
+// less than light sleep (tens of uA vs low mA) - worth it now that the panel
+// can't do clean partial refresh on this board anyway (see FULL_REFRESH_EVERY),
+// so there was nothing left to gain from staying awake between cycles.
+// Does NOT return: the chip reboots and execution restarts at setup(), not
+// loop() - loop() below is effectively dead code, kept only because Arduino
+// requires the function to exist.
 void sleepUntilNextRefresh() {
-  WiFi.disconnect(true);
-  WiFi.mode(WIFI_OFF);
-  Serial.println("Light-sleeping until next refresh...");
+  // No explicit WiFi teardown needed: esp_deep_sleep_start() powers the radio
+  // down regardless. Disconnecting first bought nothing and (before
+  // WiFi.persistent(false) in connectWiFi) was writing to flash every cycle.
+  Serial.println("Deep-sleeping until next refresh...");
   Serial.flush();
   esp_sleep_enable_timer_wakeup((uint64_t)REFRESH_SECONDS * 1000000ULL);
-  esp_light_sleep_start();
+  esp_deep_sleep_start();
 }
 
 void loop() {
-  static int cycle = 0;
-
-  // If we've crossed into the overnight window, power right down until 5am.
-  struct tm now;
-  if (getLocalTime(&now, 0) && !isWithinActiveHours(now)) {
-    deepSleepUntilActiveStart(now);   // does not return; setup() runs at 5am
-  }
-
-  cycle++;
-  bool full = (cycle % FULL_REFRESH_EVERY == 0);   // periodic ghost-clearing flash
-  doRefreshCycle(full);
-  sleepUntilNextRefresh();
+  // Never reached - see sleepUntilNextRefresh().
 }
